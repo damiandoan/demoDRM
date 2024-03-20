@@ -1,0 +1,169 @@
+version: '3'
+services:
+  library:
+    image: postgres
+    volumes:
+      - ./databases/library/init-database.sql:/docker-entrypoint-initdb.d/init-database.sql
+      - persistent-storage/library:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: books_library
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${BOOKSTORE_POSTGRES_PASSWORD}
+      CMS_SVC_USERNAME: ${CMS_SVC_USERNAME}
+      CMS_SVC_DB_INIT_PASSWORD: ${CMS_SVC_DB_INIT_PASSWORD}
+      BOOKSTORE_SVC_USERNAME: ${BOOKSTORE_SVC_USERNAME}
+      BOOKSTORE_DB_INIT_SVC_PASSWORD: ${BOOKSTORE_DB_INIT_SVC_PASSWORD}
+      RENTAL_SVC_USERNAME: ${RENTAL_SVC_USERNAME}
+      RENTAL_SVC_DB_INIT_PASSWORD: ${RENTAL_SVC_DB_INIT_PASSWORD}
+      KMS_SVC_USERNAME: ${KMS_SVC_USERNAME}
+      KMS_SVC_DB_INIT_PASSWORD: ${KMS_SVC_DB_INIT_PASSWORD}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  library_liquibase:
+    image: liquibase/liquibase:latest
+    depends_on:
+      - library
+    volumes:
+      - ./databases/library/changelog.sql:/liquibase/changelog/changelog.sql
+    command:
+      - "--changeLogFile=changelog/changelog.sql"
+      - "--url=jdbc:postgresql://library:5432/books_library"  # Use internal network name
+      - "--username=postgres"
+      - "--password=postgres"
+      - "update"
+
+  cms-service:
+    image: damiandoan/admin:latest
+    depends_on:
+      - library_liquibase
+    environment:
+      PYTHONUNBUFFERED: 1
+      BOOKSTORE_S3_AWS_ACCESS_KEY: ${BOOKSTORE_S3_AWS_ACCESS_KEY}
+      BOOKSTORE_S3_AWS_SECRET_KEY: ${BOOKSTORE_S3_AWS_SECRET_KEY}
+      POSTGRES_DB: books_library
+      POSTGRES_HOST: library
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      S3_BUCKET: demodrm-bookstore
+      FLASK_ENV: production
+
+  bookstore-service:
+    image: damiandoan/bookstore:latest
+    depends_on:
+      - library_liquibase
+    environment:
+      BOOKSTORE_SVC_USERNAME: ${BOOKSTORE_SVC_USERNAME}
+      BOOKSTORE_SVC_PASSWORD: ${BOOKSTORE_SVC_PASSWORD}
+      BOOKS_LIBRARY_DB_URL: 'jdbc:postgresql://library:5432/books_library'
+      BOOKSTORE_SERVER_PORT: ${BOOKSTORE_SERVER_PORT}
+
+  rentals_db:
+    image: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./databases/rentals/init-database.sql:/docker-entrypoint-initdb.d/init-database.sql
+    environment:
+      POSTGRES_DB: rentals_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${RENTALS_POSTGRES_PASSWORD}
+      CMS_SVC_USERNAME: ${CMS_SVC_USERNAME}
+      CMS_SVC_DB_INIT_PASSWORD: ${CMS_SVC_DB_INIT_PASSWORD}
+      RENTAL_SVC_USERNAME: ${RENTAL_SVC_USERNAME}
+      RENTAL_SVC_DB_INIT_PASSWORD: ${RENTAL_SVC_DB_INIT_PASSWORD}
+
+  accounts_db:
+    image: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./databases/accounts/init-database.sql:/docker-entrypoint-initdb.d/init-database.sql
+    environment:
+      POSTGRES_DB: accounts_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${ACCOUNTS_POSTGRES_PASSWORD}
+      CMS_SVC_USERNAME: ${CMS_SVC_USERNAME}
+      CMS_SVC_DB_INIT_PASSWORD: ${CMS_SVC_DB_INIT_PASSWORD}
+      AUTH_SVC_USERNAME: ${AUTH_SVC_USERNAME}
+      AUTH_SVC_DB_INIT_PASSWORD: ${AUTH_SVC_DB_INIT_PASSWORD}
+
+
+  ## caching
+  rental_caching:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+#    volumes:
+#      - ./persistent-storage:/data
+
+  ## RabbitMQ
+#  rabbitmq:
+#    image: "rabbitmq:3-management"
+#    ports:
+#      - "5672:5672"
+#      - "15672:15672"
+
+  rental_service:
+    image: damiandoan/rental:latest
+    environment:
+      RENTALS_REDIS_PORT: "6379"
+      RENTALS_REDIS_HOST: rental_caching
+      RENTAL_SVC_USERNAME: ${RENTAL_SVC_USERNAME}
+      RENTAL_SVC_PASSWORD: ${RENTAL_SVC_PASSWORD}
+      RENTAL_POSTGRES_HOST: rentals_db
+      RENTAL_POSTGRES_PORT: 5432
+      RENTAL_POSTGRES_DB: rentals_db
+      LIBRARY_DB_NAME: books_library
+      LIBRARY_DB_HOST: library
+      LIBRARY_DB_PORT: 5432
+
+  kms:
+    image: damiandoan/kms
+    environment:
+      DB_USERNAME: ${KMS_SVC_USERNAME}
+      DB_PASSWORD: ${KMS_SVC_DB_PASSWORD}
+      DB_HOST: library
+      DB_DATABASE: books_library
+      AUTH_SVC_HOST: auth-service
+      RENTAL_SVC_HOST: rental_service:8000
+
+  auth-service:
+    image: damiandoan/auth-service:latest
+    ports:
+      - '8000:80'
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      DB_HOST: accounts_db
+      DB_PORT: 5432
+      DB_DATABASE: accounts_db
+      DB_USERNAME: ${AUTH_SVC_USERNAME}
+      DB_PASSWORD: ${AUTH_SVC_PASSWORD}
+      AUTHSECRET: ${AUTHSECRET}
+      TOKEN_EXPIRED_SECONDS: 3600
+
+  frontend-service:
+
+    image: nginx:1.19.0-alpine
+    volumes:
+      - ./configs/frontend/nginx.conf:/etc/nginx/conf.d/default.conf # This is the nginx configuration file
+#    ports:
+#      - "8080:80" # Nginx listens on this port
+    depends_on:
+      - cms-service
+
+  frontend:
+    image: damiandoan/frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - frontend-service
+#networks:  # Define an internal network
+#  internal:
+#    name: db
